@@ -9,6 +9,7 @@ import requests
 import threading
 import platform
 import subprocess
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -30,6 +31,9 @@ except ImportError:
 DYNAMIC_WAIT_TIME = 15
 WORKER_COUNT = 6       # number of parallel Chrome workers (product scrapers)
 PAGE_CONCURRENCY = 4   # number of pages fetched from the API simultaneously
+
+# ── Session Persistence (Power Outage Resilience) ───────────────────────────
+SESSION_FILE = "mann_filter_session.json"
 
 # ── Database Config ──────────────────────────────────────────────────────────
 DB_CONFIG = {
@@ -160,26 +164,162 @@ def close_thread_driver():
             pass
         _thread_local.driver = None
 
+# ── Global network state (add near the top of your file, after constants) ──
+import threading as _threading
 
-def get_page_content(url, driver):
+_network_lock = _threading.Event()
+_network_lock.set()  # set = network is UP, clear = network is DOWN
+_network_check_lock = _threading.Lock()  # only one thread does the recovery check
+
+
+def _wait_for_network(print_fn=None):
+    """
+    Block until the network is confirmed up.
+    Only one thread actively polls; others just wait on the event.
+    """
+    if _network_lock.is_set():
+        return  # already up, fast path
+
+    # Another thread is already polling — just wait for it to signal recovery
+    msg = "[Network] Waiting for another worker to restore connection..."
+    if print_fn:
+        print_fn(msg)
+    else:
+        print(msg)
+    _network_lock.wait()  # blocks until the polling thread calls .set()
+    return
+
+
+def _network_down_handler(print_fn=None):
+    """
+    Called by the first worker to detect a network drop.
+    Polls until connectivity returns, then unblocks all waiting workers.
+    """
+    # Try to become the designated poller
+    acquired = _network_check_lock.acquire(blocking=False)
+
+    if not acquired:
+        # Another thread is already polling — just wait
+        _wait_for_network(print_fn)
+        return
+
     try:
-        driver.get(url)
-        WebDriverWait(driver, DYNAMIC_WAIT_TIME).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".cmp-product__title-name"))
-        )
-        WebDriverWait(driver, DYNAMIC_WAIT_TIME).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".cmp-table, .cmp-accordion"))
-        )
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.5)
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(0.5)
-        return driver.page_source
-    except Exception as e:
-        print(f"Error loading {url}: {e}")
-        return None
+        _network_lock.clear()  # signal all workers: network is down, pause
+
+        msg = "[Network DOWN] All workers paused. Waiting for connection..."
+        if print_fn:
+            print_fn(msg)
+        else:
+            print(msg)
+
+        # Poll every 5 seconds until we're back
+        waited = 0
+        while True:
+            time.sleep(5)
+            waited += 5
+            if _is_internet_up():
+                msg = f"[Network RESTORED] Connection back after {waited}s. Resuming all workers."
+                if print_fn:
+                    print_fn(msg)
+                else:
+                    print(msg)
+                break
+            if waited % 30 == 0:
+                msg = f"[Network] Still down after {waited}s..."
+                if print_fn:
+                    print_fn(msg)
+                else:
+                    print(msg)
+
+    finally:
+        _network_lock.set()       # unblock all waiting workers
+        _network_check_lock.release()  # allow future outages to be handled
+
+
+def _is_internet_up(host="8.8.8.8", port=53, timeout=3):
+    """Quick check: can we reach Google DNS?"""
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except Exception:
+        return False
+
+
+def get_page_content(url, driver, retries=6, base_delay=10, log_fn=None):
+    for attempt in range(retries):
+        try:
+            # Before each attempt, check if network is globally paused
+            _network_lock.wait()
+
+            driver.get(url)
+            WebDriverWait(driver, DYNAMIC_WAIT_TIME).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, ".cmp-product__title-name"))
+            )
+            WebDriverWait(driver, DYNAMIC_WAIT_TIME).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, ".cmp-table, .cmp-accordion"))
+            )
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.5)
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.5)
+            return driver.page_source
+
+        except Exception as e:
+            err_str = str(e)
+            is_network = "ERR_INTERNET_DISCONNECTED" in err_str
+            is_timeout = "Read timed out" in err_str or "HTTPConnectionPool" in err_str
+            is_last = attempt == retries - 1
+
+            if is_last:
+                print(f"Error loading {url} (attempt {attempt+1}/{retries}): {e}")
+                return None
+
+            if is_network:
+                # Trigger the global pause — all workers will wait here
+                # This does NOT consume a retry; the attempt counter only
+                # increments after the network is back and the retry fails again
+                _network_down_handler()
+                # Don't sleep after recovery — try immediately
+                # but don't increment attempt so we get a clean shot
+
+            elif is_timeout:
+                print(f"[Timeout] Restarting driver for retry {attempt+2}/{retries}...")
+                time.sleep(base_delay)
+                close_thread_driver()
+                driver = get_thread_driver()
+
+            else:
+                err_str_lower = err_str.lower()
+                is_dead_session = (
+                    "invalid session id" in err_str_lower or
+                    "no such session" in err_str_lower or
+                    "session deleted" in err_str_lower or
+                    "target window already closed" in err_str_lower or
+                    "session not created" in err_str_lower
+                )
+
+                if is_dead_session:
+                    msg = (f"[Dead session] Restarting driver for "
+                           f"retry {attempt+2}/{retries}...")
+                    if log_fn:
+                        log_fn(msg, 'warning')
+                    else:
+                        print(msg)
+                    time.sleep(3)  # brief pause before restarting
+                    close_thread_driver()
+                    driver = get_thread_driver()
+                else:
+                    time.sleep(base_delay)
+                    msg = f"[Unknown error] Retry {attempt+2}/{retries}: {e}"
+                    if log_fn:
+                        log_fn(msg, 'warning')
+                    else:
+                        print(msg)
+
+    return None
 
 
 def extract_product_data(soup, id, external_number, manufacturer, mann_filter,
@@ -382,7 +522,6 @@ def process_url(id, external_number, manufacturer, mann_filter, status,
                                     mann_filter, status, filter_type, url)
     except Exception as e:
         print(f"Error processing URL {url}: {str(e)}")
-        # If the driver crashed, reset it so next call gets a fresh one
         close_thread_driver()
         return None
 
@@ -400,7 +539,7 @@ except Exception as _db_err:
 
 
 def save_to_db(product_data, search_term):
-    """Insert a single product and its related data into MySQL."""
+    """Insert a single product and its related data into MySQL. Skips duplicates."""
     if db_pool is None:
         raise RuntimeError("Database connection pool is not available")
 
@@ -414,21 +553,36 @@ def save_to_db(product_data, search_term):
     conn = db_pool.get_connection()
     cursor = conn.cursor()
     try:
-        # Insert product
+        # ── Check if product already exists ──────────────────────────
         cursor.execute(
-            "INSERT INTO products (search_term, external_number, manufacturer, "
-            "mann_filter, status, filter_type, url) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (search_term,
-             product_data.get('external_number', ''),
-             product_data.get('manufacturer', ''),
-             product_data.get('mann_filter', ''),
-             product_data.get('status', 'Unknown'),
-             product_data.get('filter_type', ''),
-             product_data.get('url', ''))
+            "SELECT id FROM products WHERE external_number = %s AND mann_filter = %s",
+            (product_data.get('external_number', ''),
+             product_data.get('mann_filter', ''))
         )
-        product_id = cursor.lastrowid
+        existing = cursor.fetchone()
+        if existing:
+            product_id = existing[0]
 
-        # Insert dimensions
+            # ── Delete old sub-table data and re-insert fresh ─────────
+            cursor.execute("DELETE FROM dimensions WHERE product_id = %s", (product_id,))
+            cursor.execute("DELETE FROM vehicles WHERE product_id = %s", (product_id,))
+            cursor.execute("DELETE FROM oem_numbers WHERE product_id = %s", (product_id,))
+        else:
+            # ── Insert new product row ────────────────────────────────
+            cursor.execute(
+                "INSERT INTO products (search_term, external_number, manufacturer, "
+                "mann_filter, status, filter_type, url) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (search_term,
+                 product_data.get('external_number', ''),
+                 product_data.get('manufacturer', ''),
+                 product_data.get('mann_filter', ''),
+                 product_data.get('status', 'Unknown'),
+                 product_data.get('filter_type', ''),
+                 product_data.get('url', ''))
+            )
+            product_id = cursor.lastrowid
+
+        # ── Insert dimensions ─────────────────────────────────────────
         dims = product_data.get('dimensions', {})
         if isinstance(dims, dict):
             for name, value in dims.items():
@@ -436,7 +590,7 @@ def save_to_db(product_data, search_term):
                     "INSERT INTO dimensions (product_id, dimension_name, dimension_value) "
                     "VALUES (%s,%s,%s)", (product_id, name, value))
 
-        # Insert vehicles / applications
+        # ── Insert vehicles / applications ────────────────────────────
         apps = product_data.get('applications', {})
         if isinstance(apps, dict):
             for brand, models in apps.items():
@@ -462,7 +616,7 @@ def save_to_db(product_data, search_term):
                              mapped.get('HP', ''),
                              mapped.get('Year of Manufacture', '')))
 
-        # Insert OEM numbers
+        # ── Insert OEM numbers ────────────────────────────────────────
         oems = product_data.get('oem_numbers', [])
         if isinstance(oems, list):
             for entry in oems:
@@ -476,6 +630,7 @@ def save_to_db(product_data, search_term):
 
         conn.commit()
         return product_id
+
     except Exception as e:
         conn.rollback()
         raise e
@@ -739,6 +894,96 @@ class ScraperApp:
         del self._splash
         self.root.deiconify()
         self.root.state('zoomed')  # maximize after showing
+        self.root.after(500, self._check_for_resume)   # ← Resume check
+        self.root.after(600, self._update_resume_button_visibility)
+
+    # ── New: Session Management ─────────────────────────────────────────────
+    def _save_session(self):
+        if not self.is_scraping or not hasattr(self, 'current_search_terms'):
+            return
+        session = {
+            "search_terms": self.current_search_terms,
+            "term_progress": self.term_progress,
+            "failed_products": self.failed_products,
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+        }
+        try:
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(session, f, indent=2, default=str)
+        except Exception:
+            pass  # silent fail
+
+    def _load_session(self):
+        if not os.path.exists(SESSION_FILE):
+            return False
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.current_search_terms = data.get("search_terms", [])
+            self.term_progress = data.get("term_progress", {})
+            self.failed_products = data.get("failed_products", [])
+            if data.get("start_time"):
+                self.start_time = datetime.fromisoformat(data["start_time"])
+            return True
+        except Exception:
+            return False
+
+    def _check_for_resume(self):
+        if os.path.exists(SESSION_FILE):
+            if messagebox.askyesno(
+                "Resume Previous Scrape?",
+                "Previous scrape was interrupted.\n\n"
+                "Do you want to resume from where it left off?",
+                icon='question'
+            ):
+                self._resume_session()
+            else:
+                if messagebox.askyesno("Clear Session?", "Delete old session file?"):
+                    try:
+                        os.unlink(SESSION_FILE)
+                    except:
+                        pass
+
+    def _resume_session(self):
+        if not self._load_session():
+            messagebox.showinfo("No Session", "No previous session found.")
+            return
+
+        # Restore original_page_end from saved session BEFORE starting thread
+        self.original_page_end = 0
+        for v in self.term_progress.values():
+            if v.get("total_pages", 0) > 0 and not v.get("auto_mode", False):
+                self.original_page_end = v["total_pages"]
+                break
+
+        # Detect if original session was auto or manual mode
+        was_auto = any(v.get("auto_mode", False) for v in self.term_progress.values())
+
+        self.is_scraping = True
+        self.root.after(0, self._update_resume_button_visibility)
+        self.should_stop = False
+        self.start_btn.config(state='disabled')
+        self.resume_btn.config(state='disabled')
+        self.cancel_btn.config(state='normal')
+        self._update_status_dot()
+        self._reset_workers()
+        self._update_metrics()
+
+        # Pass correct page_start/page_end so auto_pages is correctly determined
+        if was_auto:
+            p_start, p_end = None, None
+        else:
+            p_start = 1
+            p_end = self.original_page_end  # e.g. 3
+
+        thread = threading.Thread(
+            target=self._run_scraper,
+            args=([], p_start, p_end),
+            kwargs={"resume": True},
+            daemon=True
+        )
+        thread.start()
+        self._update_stats_timer()
 
     def _init_state(self):
         """Initialize app state and console tags (called from splash)."""
@@ -749,7 +994,11 @@ class ScraperApp:
         self.processed_count = 0
         self.saved_count = 0
         self.error_count = 0
+        self.term_progress = {}
+        self.current_search_terms = []
+        self.original_page_end = 0
         self.failed_products = []
+        self._update_resume_button_visibility()
 
         # Worker slot tracking (thread-safe queue of free slot indices)
 
@@ -1138,6 +1387,11 @@ class ScraperApp:
                                     command=self.start_scraping, style='Nav.TButton')
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
 
+        self.resume_btn = ttk.Button(bar, text="Resume Scraping",
+                                     command=self._resume_session,
+                                     style='Retry.TButton')
+        self.resume_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         self.cancel_btn = ttk.Button(bar, text="Cancel",
                                      command=self.cancel_scraping,
                                      style='Danger.TButton', state='disabled')
@@ -1150,9 +1404,17 @@ class ScraperApp:
 
         ttk.Button(bar, text="Help", command=self.show_help,
                    style='Help.TButton').pack(side=tk.RIGHT)
-
         ttk.Button(bar, text="View Data", command=self._open_data_viewer,
                    style='Data.TButton').pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _update_resume_button_visibility(self):
+        """Show Resume button only when session file exists and not scraping"""
+        if hasattr(self, 'resume_btn'):
+            should_show = (not self.is_scraping) and os.path.exists(SESSION_FILE)
+            if should_show:
+                self.resume_btn.config(state='normal')
+            else:
+                self.resume_btn.config(state='disabled')
 
     # ── Footer ───────────────────────────────────────────────────────────
     def _build_footer(self):
@@ -1275,41 +1537,59 @@ class ScraperApp:
 
     # ── Logging / Progress ───────────────────────────────────────────────
     def log_message(self, message, level='info'):
-        self.console.config(state='normal')
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.console.insert(tk.END, f"[{ts}] ", 'timestamp')
-        self.console.insert(tk.END, f"{message}\n", level)
-        self.console.see(tk.END)
-        self.console.config(state='disabled')
-        self.root.update_idletasks()
-
-    def update_page_progress(self, current, total):
-        self.page_progress['maximum'] = total
-        self.page_progress['value'] = current
-        self.page_label.config(text=f"Pages: {current} / {total}")
-        self._update_status_dot()
-        self.root.update_idletasks()
+        def _do():
+            try:
+                self.console.config(state='normal')
+                ts = datetime.now().strftime("%H:%M:%S")
+                self.console.insert(tk.END, f"[{ts}] ", 'timestamp')
+                self.console.insert(tk.END, f"{message}\n", level)
+                self.console.see(tk.END)
+                self.console.config(state='disabled')
+            except Exception:
+                pass
+        self.root.after(0, _do)
 
     def update_product_progress(self, count):
-        self.product_progress['value'] = count
-        self.product_label.config(text=f"Products: {count}")
         self.processed_count = count
-        self._update_status_dot()
-        self._update_stats()
-        self.root.update_idletasks()
+        def _do():
+            try:
+                self.product_progress['value'] = count
+                self.product_label.config(text=f"Products: {count}")
+                self._update_stats()
+            except Exception:
+                pass
+        self.root.after(0, _do)
+
+    def update_page_progress(self, current, total):
+        def _do():
+            try:
+                self.page_progress['maximum'] = total
+                self.page_progress['value'] = current
+                self.page_label.config(text=f"Pages: {current} / {total}")
+                self._update_status_dot()
+            except Exception:
+                pass
+        self.root.after(0, _do)
 
     def update_current_product(self, name):
-        display = name[:80] + ("..." if len(name) > 80 else "")
-        self.current_product_label.config(text=display)
-        self.root.update_idletasks()
+        def _do():
+            try:
+                display = name[:80] + ("..." if len(name) > 80 else "")
+                self.current_product_label.config(text=display)
+            except Exception:
+                pass
+        self.root.after(0, _do)
 
     def _update_metrics(self):
-        """Update the metrics dashboard cards."""
-        self.error_count = len(self.failed_products)
-        self.metric_labels['scraped'].config(text=str(self.processed_count))
-        self.metric_labels['saved'].config(text=str(self.saved_count))
-        self.metric_labels['errors'].config(text=str(self.error_count))
-        self.root.update_idletasks()
+        def _do():
+            try:
+                self.error_count = len(self.failed_products)
+                self.metric_labels['scraped'].config(text=str(self.processed_count))
+                self.metric_labels['saved'].config(text=str(self.saved_count))
+                self.metric_labels['errors'].config(text=str(self.error_count))
+            except Exception:
+                pass
+        self.root.after(0, _do)
 
     def _update_status_dot(self):
         if self.is_scraping:
@@ -1339,6 +1619,7 @@ class ScraperApp:
             product_name = self.product_name_entry.get().strip()
             s_start = self.search_start_entry.get().strip()
             s_end = self.search_end_entry.get().strip()
+            self.term_progress = {}
 
             # Determine search terms: product name OR numeric range
             if product_name:
@@ -1370,6 +1651,7 @@ class ScraperApp:
                     return
 
             self.is_scraping = True
+            self.root.after(0, self._update_resume_button_visibility)
             self.should_stop = False
             self.start_btn.config(state='disabled')
             self.cancel_btn.config(state='normal')
@@ -1479,167 +1761,137 @@ class ScraperApp:
         except Exception as e:
             return None, page
 
-    def _run_scraper(self, search_terms, page_start, page_end):
+    def _run_scraper(self, search_terms, page_start, page_end, resume=False):
         cleanup_drivers()
         product_executor = ThreadPoolExecutor(max_workers=WORKER_COUNT)
         page_executor = ThreadPoolExecutor(max_workers=PAGE_CONCURRENCY)
+        self.start_time = datetime.now()
+
         try:
-            auto_pages = page_start is None  # product-name mode
+            try:
+                ui_end_page = int(self.page_end_spin.get().strip())
+            except (ValueError, AttributeError):
+                ui_end_page = page_end if page_end is not None else 667
+            if resume:
+                search_terms = self.current_search_terms or search_terms
+                # original_page_end already restored in _resume_session before thread launch
+                if not self.original_page_end:
+                    self.original_page_end = ui_end_page  # last-resort fallback only
+                self.log_message("=== RESUMING PREVIOUS SCRAPE ===", 'success')
+            else:
+                self.current_search_terms = list(search_terms)
+                self.term_progress = {}
+                self.original_page_end = ui_end_page  
+
+            auto_pages = page_start is None
+
             self.log_message(
-                f"Starting with {WORKER_COUNT} workers, "
-                f"{PAGE_CONCURRENCY} pages in parallel", 'info')
+                f"Starting{'/resuming' if resume else ''} with {WORKER_COUNT} workers, "
+                f"{PAGE_CONCURRENCY} pages in parallel | Mode: {'AUTO' if auto_pages else f'MANUAL (1-{self.original_page_end})'}", 'info')
 
             for search_term in search_terms:
-                if self.should_stop:
-                    break
+                if self.should_stop: break
+                term_key = str(search_term)
 
-                product_id = 0
-                pages_completed = 0
+                if term_key not in self.term_progress:
+                    self.term_progress[term_key] = {
+                        "pages_completed": 0,
+                        "total_pages": self.original_page_end if not auto_pages else 0,
+                        "auto_mode": auto_pages,
+                        "product_id": 0
+                    }
+                elif not resume:
+                    self.term_progress[term_key]["total_pages"] = self.original_page_end if not auto_pages else self.term_progress[term_key].get("total_pages", 0)
 
-                self.log_message(f"\nProcessing search term: {search_term}", 'info')
+                prog = self.term_progress[term_key]
+                pages_completed = prog.get("pages_completed", 0)
+                product_id = prog.get("product_id", 0)
 
+                self.log_message(f"\nProcessing search term: {search_term} (pages completed: {pages_completed})", 'info')
+
+                # ====================== AUTO MODE ======================
                 if auto_pages:
-                    # Fetch page 1 first to discover total pages
-                    self.log_message("Fetching page 1 to discover total pages...",
-                                     'info')
-                    catalog, _ = self._fetch_page_api(search_term, 1)
-                    if catalog is None:
-                        self.log_message("API returned no results.", 'warning')
-                        continue
-                    page_info = catalog.get('pageInfo', {})
-                    discovered_total = page_info.get('totalPages', 1)
-                    total_items = catalog.get('totalCount', 0)
-                    self.log_message(
-                        f"Found {total_items} items across "
-                        f"{discovered_total} pages", 'info')
-                    self.product_progress['maximum'] = total_items
-                    self.update_page_progress(0, discovered_total)
+                    if pages_completed == 0:
+                        self.log_message("Fetching page 1 to discover total pages...", 'info')
+                        catalog, _ = self._fetch_page_api(search_term, 1)
+                        if catalog is None:
+                            self.log_message("API returned no results.", 'warning')
+                            continue
 
-                    # Collect products from page 1
-                    first_page_items = []
-                    for item in catalog['items']:
-                        if item.get('product'):
-                            product_id += 1
-                            first_page_items.append({
-                                'id': product_id,
-                                'external_number': item.get('externalNumber', ''),
-                                'manufacturer': item.get('manufacturer', ''),
-                                'mann_filter': item['product'].get('sku', ''),
-                                'status': extract_product_status(
-                                    item['product'].get('attributes', [])),
-                                'filter_type': item.get('filterBy', ''),
-                                'url': (
-                                    "https://www.mann-filter.com/tr-tr/katalog/"
-                                    "arama-sonuclar%C4%B1/urun.html/"
-                                    f"{item['product'].get('sku', '').lower()}.html"
-                                ),
-                            })
-                    pages_completed = 1
-                    self.update_page_progress(1, discovered_total)
+                        discovered_total = catalog.get('pageInfo', {}).get('totalPages', 1)
+                        total_items = catalog.get('totalCount', 0)
 
-                    # Process page-1 products
-                    if first_page_items and not self.should_stop:
-                        self.log_message(
-                            f"Processing {len(first_page_items)} products "
-                            f"from page 1...", 'info')
-                        futs = {
-                            product_executor.submit(
-                                self._process_single_product, ref, search_term
-                            ): ref for ref in first_page_items
-                        }
-                        for future in as_completed(futs):
-                            if self.should_stop:
-                                break
-                            ref = futs[future]
-                            try:
-                                result = future.result()
-                                if result is None:
-                                    continue
-                                status, name, detail = result
-                                if status == 'success':
-                                    self.saved_count += 1
-                                    self.log_message(
-                                        f"Saved to DB (id={detail}): {name}",
-                                        'success')
-                                elif status == 'db_error':
-                                    self.error_count += 1
-                                    self.failed_products.append({
-                                        'ref': ref, 'search_term': search_term,
-                                        'error': f"DB: {detail}",
-                                        'time': datetime.now().strftime('%H:%M:%S')})
-                                    self.log_message(
-                                        f"DB error for {name}: {detail}", 'error')
-                                elif status == 'no_data':
-                                    self.error_count += 1
-                                    self.failed_products.append({
-                                        'ref': ref, 'search_term': search_term,
-                                        'error': "No data returned from page",
-                                        'time': datetime.now().strftime('%H:%M:%S')})
-                            except Exception as exc:
-                                self.error_count += 1
-                                self.failed_products.append({
-                                    'ref': ref, 'search_term': search_term,
-                                    'error': str(exc),
-                                    'time': datetime.now().strftime('%H:%M:%S')})
-                                self.log_message(
-                                    f"Worker error for {ref['mann_filter']}: "
-                                    f"{exc}", 'error')
-                            self.processed_count += 1
-                            self.update_product_progress(self.processed_count)
-                            self.update_current_product(ref['mann_filter'])
-                            self._update_metrics()
+                        self.log_message(f"Found {total_items} items across {discovered_total} pages", 'info')
 
-                    # Use remaining pages (2..N) for the normal batch loop
-                    eff_start = 2
-                    eff_end = discovered_total
+                        prog["total_pages"] = discovered_total
+                        self.product_progress['maximum'] = total_items
+                        self.update_page_progress(0, discovered_total)
+                        self._save_session()
+
+                        # Process page 1
+                        first_page_items = []
+                        for item in catalog.get('items', []):
+                            if item.get('product'):
+                                product_id += 1
+                                first_page_items.append({
+                                    'id': product_id,
+                                    'external_number': item.get('externalNumber', ''),
+                                    'manufacturer': item.get('manufacturer', ''),
+                                    'mann_filter': item['product'].get('sku', ''),
+                                    'status': extract_product_status(item['product'].get('attributes', [])),
+                                    'filter_type': item.get('filterBy', ''),
+                                    'url': f"https://www.mann-filter.com/tr-tr/katalog/arama-sonuclar%C4%B1/urun.html/{item['product'].get('sku', '').lower()}.html"
+                                })
+
+                        pages_completed = 1
+                        prog["pages_completed"] = 1
+                        prog["product_id"] = product_id
+                        self.update_page_progress(1, discovered_total)
+                        self._save_session()
+
+                        if first_page_items and not self.should_stop:
+                            self._process_batch_products(first_page_items, search_term, product_executor)
+
+                    eff_start = pages_completed + 1
+                    eff_end = prog["total_pages"]
+
+                # ====================== MANUAL MODE ======================
                 else:
-                    eff_start = page_start
-                    eff_end = page_end
+                    if prog.get("total_pages", 0) == 0:
+                        prog["total_pages"] = self.original_page_end
 
-                self.update_page_progress(pages_completed,
-                                          eff_end - (1 if auto_pages else eff_start) + 1)
+                    eff_end = prog["total_pages"]
+                    eff_start = max(pages_completed + 1, page_start if page_start is not None else 1)
+                    self._save_session()
 
-                # Process pages in batches of PAGE_CONCURRENCY
+                if eff_start > eff_end:
+                    self.log_message(f"Search term {search_term} already completed", 'success')
+                    continue
+
+                # Batch processing for remaining pages
                 all_pages = list(range(eff_start, eff_end + 1))
-                total_items_set = auto_pages  # already set if auto
 
                 for batch_start in range(0, len(all_pages), PAGE_CONCURRENCY):
                     if self.should_stop:
                         break
 
-                    batch = all_pages[batch_start:batch_start + PAGE_CONCURRENCY]
-                    self.log_message(
-                        f"Fetching pages {batch[0]}–{batch[-1]} simultaneously "
-                        f"({len(batch)} pages)...", 'info')
+                    batch = all_pages[batch_start : batch_start + PAGE_CONCURRENCY]
+                    self.log_message(f"Fetching pages {batch[0]}–{batch[-1]}...", 'info')
 
-                    # ── Fetch all pages in this batch concurrently ────────
                     page_futures = {
-                        page_executor.submit(self._fetch_page_api, search_term, p): p
+                        page_executor.submit(self._fetch_page_api, search_term, p): p 
                         for p in batch
                     }
 
-                    # Collect products from all pages in this batch
                     batch_items = []
                     for pf in as_completed(page_futures):
                         if self.should_stop:
                             break
                         catalog, page_num = pf.result()
                         if catalog is None:
-                            self.log_message(
-                                f"API error on page {page_num}", 'error')
-                            self.error_count += 1
-                            self._update_metrics()
                             continue
 
-                        # Set total items from first successful response
-                        if not total_items_set:
-                            total_items = catalog.get('totalCount', 0)
-                            self.log_message(
-                                f"Found {total_items} total items", 'info')
-                            self.product_progress['maximum'] = total_items
-                            total_items_set = True
-
-                        for item in catalog['items']:
+                        for item in catalog.get('items', []):
                             if item.get('product'):
                                 product_id += 1
                                 batch_items.append({
@@ -1647,106 +1899,135 @@ class ScraperApp:
                                     'external_number': item.get('externalNumber', ''),
                                     'manufacturer': item.get('manufacturer', ''),
                                     'mann_filter': item['product'].get('sku', ''),
-                                    'status': extract_product_status(
-                                        item['product'].get('attributes', [])),
+                                    'status': extract_product_status(item['product'].get('attributes', [])),
                                     'filter_type': item.get('filterBy', ''),
-                                    'url': (
-                                        "https://www.mann-filter.com/tr-tr/katalog/"
-                                        "arama-sonuclar%C4%B1/urun.html/"
-                                        f"{item['product'].get('sku', '').lower()}.html"
-                                    ),
+                                    'url': f"https://www.mann-filter.com/tr-tr/katalog/arama-sonuclar%C4%B1/urun.html/{item['product'].get('sku', '').lower()}.html"
                                 })
 
                         pages_completed += 1
-                        self.update_page_progress(
-                            pages_completed,
-                            eff_end - (1 if auto_pages else eff_start) + 1)
+                        self.update_page_progress(pages_completed, eff_end - eff_start + 1)
 
-                    if self.should_stop:
-                        break
+                    if batch_items:
+                        self._process_batch_products(batch_items, search_term, product_executor)
 
-                    self.log_message(
-                        f"Processing {len(batch_items)} products from "
-                        f"{len(batch)} pages ({WORKER_COUNT} workers)...", 'info')
-
-                    # ── Submit all products from this batch to workers ────
-                    product_futures = {
-                        product_executor.submit(
-                            self._process_single_product, ref, search_term): ref
-                        for ref in batch_items
-                    }
-
-                    for future in as_completed(product_futures):
-                        if self.should_stop:
-                            break
-                        ref = product_futures[future]
-                        try:
-                            result = future.result()
-                            if result is None:
-                                continue
-                            status, name, detail = result
-                            if status == 'success':
-                                self.saved_count += 1
-                                self.log_message(
-                                    f"Saved to DB (id={detail}): {name}", 'success')
-                            elif status == 'db_error':
-                                self.error_count += 1
-                                self.failed_products.append({
-                                    'ref': ref, 'search_term': search_term,
-                                    'error': f"DB: {detail}",
-                                    'time': datetime.now().strftime('%H:%M:%S')})
-                                self.log_message(
-                                    f"DB error for {name}: {detail}", 'error')
-                            elif status == 'no_data':
-                                self.error_count += 1
-                                self.failed_products.append({
-                                    'ref': ref, 'search_term': search_term,
-                                    'error': "No data returned from page",
-                                    'time': datetime.now().strftime('%H:%M:%S')})
-                        except Exception as exc:
-                            self.error_count += 1
-                            self.failed_products.append({
-                                'ref': ref, 'search_term': search_term,
-                                'error': str(exc),
-                                'time': datetime.now().strftime('%H:%M:%S')})
-                            self.log_message(
-                                f"Worker error for {ref['mann_filter']}: {exc}",
-                                'error')
-                        self.processed_count += 1
-                        self.update_product_progress(self.processed_count)
-                        self.update_current_product(ref['mann_filter'])
-                        self._update_metrics()
-
-                    time.sleep(0.3)
+                    prog["pages_completed"] = pages_completed
+                    prog["product_id"] = product_id
+                    self._save_session()
 
                 if not self.should_stop:
-                    self.log_message(
-                        f"Completed search term {search_term}", 'success')
+                    self.log_message(f"Completed search term {search_term}", 'success')
 
-            if self.should_stop:
-                self.log_message("\nScraping cancelled by user", 'warning')
-                messagebox.showinfo("Cancelled", "Scraping was cancelled")
-            else:
+            if not self.should_stop:
                 self.log_message("\nAll search terms processed", 'success')
                 messagebox.showinfo("Complete", "Scraping completed!")
+                if os.path.exists(SESSION_FILE):
+                    try:
+                        os.unlink(SESSION_FILE)
+                        self.log_message("✅ Session file deleted.", 'success')
+                    except Exception:
+                        pass
 
         except Exception as e:
-            self.log_message(f"\nFatal error: {e}", 'error')
-            messagebox.showerror("Error", f"Fatal error: {e}")
+            self.log_message(f"Fatal error: {e}", 'error')
+            messagebox.showerror("Error", str(e))
         finally:
-            # Shut down workers and close their drivers
             product_executor.shutdown(wait=False)
             page_executor.shutdown(wait=False)
             self.log_message("Closing browser workers...", 'info')
-            end_time = datetime.now()
-            self.root.after(0, lambda: self.end_time_label.config(
-                text=f"End: {end_time.strftime('%H:%M:%S')}"))
+            self._save_session()
             self.is_scraping = False
-            self.root.after(0, lambda: self.start_btn.config(state='normal'))
-            self.root.after(0, lambda: self.cancel_btn.config(state='disabled'))
-            self.root.after(0, self._update_status_dot)
-            self.root.after(0, self._reset_workers)
+
+            def safe_after(cmd):
+                try:
+                    if self.root.winfo_exists():
+                        self.root.after(0, cmd)
+                except:
+                    pass
+
+            end_time = datetime.now()
+            safe_after(lambda: self.end_time_label.config(text=f"End: {end_time.strftime('%H:%M:%S')}"))
+            safe_after(lambda: self.start_btn.config(state='normal'))
+            safe_after(lambda: self.resume_btn.config(state='normal'))
+            safe_after(lambda: self.cancel_btn.config(state='disabled'))
+            safe_after(self._update_status_dot)
+            safe_after(self._reset_workers)
+            safe_after(self._update_resume_button_visibility)
+
             self.log_message("\nScraping finished", 'info')
+
+    # Helper method to avoid code duplication
+    def _process_batch_products(self, items, search_term, executor):
+        """Process products and save session AFTER EVERY successful product"""
+        if not items or self.should_stop:
+            return
+
+        product_futures = {
+            executor.submit(self._process_single_product, ref, search_term): ref
+            for ref in items
+        }
+
+        for future in as_completed(product_futures):
+            if self.should_stop:
+                break
+
+            ref = product_futures[future]
+            success = False
+
+            try:
+                result = future.result()
+                if result is None:
+                    continue
+
+                status, name, detail = result
+
+                if status == 'success':
+                    self.saved_count += 1
+                    self.log_message(f"Saved to DB (id={detail}): {name}", 'success')
+                    success = True
+                elif status == 'db_error':
+                    self.error_count += 1
+                    self.failed_products.append({
+                        'ref': ref, 
+                        'search_term': search_term,
+                        'error': f"DB: {detail}",
+                        'time': datetime.now().strftime('%H:%M:%S')
+                    })
+                    self.log_message(f"DB error for {name}: {detail}", 'error')
+                elif status == 'no_data':
+                    self.error_count += 1
+                    self.failed_products.append({
+                        'ref': ref, 
+                        'search_term': search_term,
+                        'error': "No data returned from page",
+                        'time': datetime.now().strftime('%H:%M:%S')
+                    })
+
+            except Exception as exc:
+                self.error_count += 1
+                self.failed_products.append({
+                    'ref': ref, 
+                    'search_term': search_term,
+                    'error': str(exc),
+                    'time': datetime.now().strftime('%H:%M:%S')
+                })
+                self.log_message(f"Worker error for {ref['mann_filter']}: {exc}", 'error')
+
+            # Update UI progress
+            self.processed_count += 1
+            self.update_product_progress(self.processed_count)
+            self.update_current_product(ref['mann_filter'])
+            self._update_metrics()
+
+            # === KEY CHANGE: Save session after EVERY successful product ===
+            if success:
+                term_key = str(search_term)
+                if term_key in self.term_progress:
+                    self.term_progress[term_key]["product_id"] = self.processed_count  # ← Only update product_id
+                self._save_session()   # ← Save immediately after success
+
+            # Safety net: save every 5 products even if some failed
+            elif self.processed_count % 5 == 0:
+                self._save_session()
 
     # ── Error Window ────────────────────────────────────────────────────
     def _open_error_window(self):
@@ -2922,6 +3203,8 @@ class ScraperApp:
             self.should_stop = True
             self.log_message("Cancellation requested...", 'warning')
             self.cancel_btn.config(state='disabled')
+            self._save_session()
+            self.root.after(0, self._update_resume_button_visibility)
 
     def show_help(self):
         messagebox.showinfo("Help", (

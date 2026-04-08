@@ -31,7 +31,7 @@ def setup():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id              INT AUTO_INCREMENT PRIMARY KEY,
-            search_term     INT            NOT NULL,
+            search_term     VARCHAR(255)   NOT NULL,
             external_number VARCHAR(255)   NOT NULL DEFAULT '',
             manufacturer    VARCHAR(255)   NOT NULL DEFAULT '',
             mann_filter     VARCHAR(255)   NOT NULL DEFAULT '',
@@ -40,6 +40,7 @@ def setup():
             url             TEXT           NOT NULL,
             created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
 
+            UNIQUE KEY uq_product (external_number, manufacturer, mann_filter),
             INDEX idx_mann_filter (mann_filter),
             INDEX idx_search_term (search_term),
             INDEX idx_manufacturer (manufacturer)
@@ -56,6 +57,7 @@ def setup():
             dimension_value VARCHAR(255)   NOT NULL,
 
             FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+            UNIQUE KEY uq_dim (product_id, dimension_name),
             INDEX idx_product_id (product_id)
         ) ENGINE=InnoDB
     """)
@@ -66,17 +68,18 @@ def setup():
         CREATE TABLE IF NOT EXISTS vehicles (
             id                  INT AUTO_INCREMENT PRIMARY KEY,
             product_id          INT            NOT NULL,
-            brand               VARCHAR(255)   NOT NULL DEFAULT '',
-            model               VARCHAR(255)   NOT NULL DEFAULT '',
+            brand               VARCHAR(100)   NOT NULL DEFAULT '',
+            model               VARCHAR(100)   NOT NULL DEFAULT '',
             model_type          VARCHAR(255)   NOT NULL DEFAULT '',
-            filter_type         VARCHAR(255)   NOT NULL DEFAULT '',
-            engine_code         VARCHAR(255)   NOT NULL DEFAULT '',
+            filter_type         VARCHAR(100)   NOT NULL DEFAULT '',
+            engine_code         VARCHAR(100)   NOT NULL DEFAULT '',
             ccm                 VARCHAR(50)    NOT NULL DEFAULT '',
             kw                  VARCHAR(50)    NOT NULL DEFAULT '',
             hp                  VARCHAR(50)    NOT NULL DEFAULT '',
-            year_of_manufacture VARCHAR(100)   NOT NULL DEFAULT '',
+            year_of_manufacture VARCHAR(50)    NOT NULL DEFAULT '',
 
             FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+            UNIQUE KEY uq_veh (product_id, brand(100), model(100), engine_code(100), year_of_manufacture(50)),
             INDEX idx_product_id (product_id),
             INDEX idx_brand (brand)
         ) ENGINE=InnoDB
@@ -92,6 +95,7 @@ def setup():
             oem_number      VARCHAR(255)   NOT NULL DEFAULT '',
 
             FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+            UNIQUE KEY uq_oem (product_id, manufacturer, oem_number),
             INDEX idx_product_id (product_id),
             INDEX idx_oem_number (oem_number)
         ) ENGINE=InnoDB
